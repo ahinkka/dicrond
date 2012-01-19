@@ -1,0 +1,181 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2012, Atte Hinkka <atte.hinkka@iki.fi>
+
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+"""
+Distributable, Interval-based CRON Daemon
+
+Should guarantee deterministic scheduling of commands run with intervals of
+seconds.
+
+dicrond crontab specifies intervals, not times and are of format
+<I> [E/S] command
+ ┬    ┬     ┬
+ │    │     │
+ │    │     └─── command to run in a shell
+ │    └─── E denotes the scheduling number of the dicron process and S the
+ |         number of cron processes running, e.g. 3/7 if this is #3 of 7
+ │         dicrons.  This is to ensure something is run at known intervals
+ │         *somewhere*.  This parameter is optional as denoted by brackets.
+ └───── I is the interval in seconds
+"""
+import logging
+import random
+import os
+
+from subprocess import Popen, PIPE
+from threading import Thread
+# from multiprocessing import Process
+from time import sleep
+from os.path import isfile
+from os import environ as env
+from datetime import datetime, timedelta
+
+LOG_FORMAT = '%(asctime)-15s %(job)-8s %(message)s'
+logging.basicConfig(format=LOG_FORMAT)
+logger = logging.getLogger('dicrond')
+
+TICK=0.001
+
+class CronFileFormatError(Exception):
+    pass
+
+class Job (object):
+    def __init__(self, deadline, interval, command):
+       self.deadline = deadline
+       self.interval = interval
+       self.command = command
+
+    def execute(self, extra_env={}):
+        new_env = {}
+        for k, v in env.iteritems():
+            new_env[k] = v
+        for k, v in extra_env.iteritems():
+            new_env[k] = v
+
+        logger.debug("Running with extra_env %s" % extra_env, extra={'job': str(self)})
+        p = Popen(self.command, shell=True)
+
+    def identity(self):
+        return self.command
+
+    @classmethod
+    def from_line(cls, line):
+        if len(line) < 3 or line[0] == '#' or line[0] == ';':
+           return
+        parts = line.split(' ', 2)
+
+        interval = float(parts[0])
+
+        if len(parts) == 2 or not ('/' in parts[1]):
+            return Job(interval, ' '.join(parts[1:]))
+
+        instance_number, instance_count = [int(i) for i in parts[1].split('/')]
+        if instance_number < 1:
+            raise CronFileFormatError("Instance number must be 1 or larger if defined!")
+
+        # Set the first deadline to be (E -1) * interval seconds after the next minute
+        next_minute = datetime.now() + timedelta(minutes=1)
+        next_minute = next_minute - timedelta(seconds=next_minute.second)
+        next_minute = next_minute - timedelta(microseconds=next_minute.microsecond)
+        first_deadline = next_minute + timedelta(seconds=(instance_number - 1) * interval)
+
+        # This part of the code is strictly optional, but makes short interval
+        # jobs start as early as possible, not after the next minute
+        offset = int(instance_count * interval)
+        while (first_deadline - datetime.now()).total_seconds() > offset:
+            first_deadline = first_deadline - timedelta(seconds=offset)
+
+        command = ' '.join(parts[2:])
+        logger.debug("First deadline: %s" % first_deadline, extra={'job': command})
+        return Job(first_deadline, interval * instance_count, command)
+
+    def __str__(self):
+        return str(self.identity())
+
+
+class ReadConfigJob(Job):
+    def __init__(self, interval, conf_path):
+        super(ReadConfigJob, self).__init__(datetime.now(), interval, None)
+        self.interval = interval
+        self.conf_path = conf_path
+        self.last_mtime = None
+
+    def identity(self):
+        return self.__class__.__name__
+
+    def execute(self):
+        global _jobs
+        new_jobs = []
+        
+        if self.last_mtime is None or \
+            self.last_mtime < os.stat(self.conf_path).st_mtime:
+            with open(self.conf_path, 'r') as f:
+                for line in f:
+                    line = line.replace('\n', '')
+                    job = Job.from_line(line)
+                    if job:
+                        new_jobs.append(job)
+
+            logger.info("Read config file with %i entries" % len(new_jobs),
+                        extra={'job': str(self)})
+            _jobs = new_jobs
+            _jobs.append(self)
+            self.last_mtime = os.stat(self.conf_path).st_mtime
+
+
+def main(conf_file):
+    global _jobs
+    _jobs = [ReadConfigJob(1.0, conf_file)]
+
+    while True:
+        now = datetime.now()
+        for job in _jobs:
+            if job.deadline <= now:
+                new_deadline = job.deadline + timedelta(seconds=job.interval)
+                if new_deadline < datetime.now():
+                    new_deadline = now + timedelta(seconds=job.interval)
+                job.deadline = new_deadline
+
+                if not isinstance(job, ReadConfigJob):
+                    logger.debug("Next deadline: %s" % job.deadline, extra={'job': job})
+
+                t = Thread(target=job.execute, name=job.identity())
+                # p = Process(target=job.execute)
+                t.run()
+        sleep(TICK)
+
+
+if __name__ == '__main__':
+    from optparse import OptionParser
+    parser = OptionParser()
+    parser.add_option("-c", "--config-file", dest="config",
+                      help="read configuration from FILE", metavar="FILE")
+    parser.add_option("-v", "--verbose",
+                      action="store_true", dest="verbose", default=False,
+                      help="be more verbose, writes to STDERR")
+    opts, args = parser.parse_args()
+
+    if not opts.config:
+        parser.error("Configuration file not set!")
+    if not isfile(opts.config):
+        parser.error("Configuration file (%s) points to something that isn't a file!" % opts.config)
+
+    if opts.verbose:
+        logger.setLevel(logging.DEBUG)
+        logger.info("Verbose logging turned on!", extra={'job': 'main'})
+
+    main(opts.config)
